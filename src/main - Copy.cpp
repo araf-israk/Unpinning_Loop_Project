@@ -333,10 +333,6 @@ int main() {
     std::set<int> bannedBeads;
     std::shared_ptr<Bead> draggingBead = nullptr;
     Vector2 dragOffset = { 0.0f, 0.0f };
-\
-    // Track beads currently undergoing physics-driven collapse animation
-    // Maps Bead ID -> Current Rest Length Multiplier Scalar (1.0f down to 0.0f)
-    std::map<int, float> collapsingBeads;
 
     BackupState backup;
     int lastRemovedBeadId = -1;
@@ -386,10 +382,7 @@ int main() {
                 currentEdge.clear();
             }
             else if (bead->type != "vertex" && bead->active) {
-                // Ensure automation ignores elements currently in active physics decay
-                if (CanRemove(idx, sequence, bannedBeads) && !collapsingBeads.contains(bead->id)) {
-                    currentEdge.push_back(idx);
-                }
+                if (CanRemove(idx, sequence, bannedBeads)) currentEdge.push_back(idx);
             }
         }
 
@@ -445,8 +438,8 @@ int main() {
     while (!WindowShouldClose()) {
         Vector2 mousePos = GetMousePosition();
 
-// --------------------------------------------------------------------
-        // A. USER POLL CONTROL INPUT PIPELINE (With Reidemeister 1 Move Support)
+        // --------------------------------------------------------------------
+        // A. USER POLL CONTROL INPUT PIPELINE
         // --------------------------------------------------------------------
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             Rectangle btnBounds = { SCREEN_WIDTH / 2.0f - 100, 45, 200, 40 };
@@ -462,136 +455,18 @@ int main() {
                 }
             }
             else {
-                // 1. Check if the user clicked on a static Anchor Pin (Face Bead)
-                std::shared_ptr<Bead> clickedFace = nullptr;
-                for (auto& fBead : faceBeads) {
-                    if (CheckCollisionPointCircle(mousePos, fBead->pos, RADIUS)) {
-                        clickedFace = fBead;
+                // Search for valid node element intersections to begin tracking drag operations
+                for (auto& n : nodes) {
+                    if (!n->active) continue;
+                    if (CheckCollisionPointCircle(mousePos, n->pos, RADIUS)) {
+                        draggingBead = n;
+                        dragOffset = { n->pos.x - mousePos.x, n->pos.y - mousePos.y };
                         break;
-                    }
-                }
-
-                if (clickedFace != nullptr) {
-                    // Find the single closest active wire bead to this pin
-                    int closestIdx = -1;
-                    float minDst = INFINITY;
-                    for (size_t i = 0; i < sequence.size(); i++) {
-                        if (!sequence[i]->active) continue;
-                        float dst = std::hypot(sequence[i]->pos.x - clickedFace->pos.x, sequence[i]->pos.y - clickedFace->pos.y);
-                        if (dst < minDst) {
-                            minDst = dst;
-                            closestIdx = i;
-                        }
-                    }
-
-                    if (closestIdx != -1) {
-                        // Gather a continuous block of neighboring wire beads near the pin
-                        std::vector<int> loopIndices;
-                        loopIndices.push_back(closestIdx);
-                        int nSize = sequence.size();
-                        float thresholdDist = RADIUS * 8.0f; // Detection radius
-
-                        // Scan Left
-                        int curr = (closestIdx - 1 + nSize) % nSize;
-                        while (curr != closestIdx) {
-                            float dst = std::hypot(sequence[curr]->pos.x - clickedFace->pos.x, sequence[curr]->pos.y - clickedFace->pos.y);
-                            if (dst < thresholdDist) {
-                                loopIndices.insert(loopIndices.begin(), curr);
-                                curr = (curr - 1 + nSize) % nSize;
-                            } else break;
-                        }
-                        // Scan Right
-                        curr = (closestIdx + 1) % nSize;
-                        while (curr != closestIdx) {
-                            float dst = std::hypot(sequence[curr]->pos.x - clickedFace->pos.x, sequence[curr]->pos.y - clickedFace->pos.y);
-                            if (dst < thresholdDist) {
-                                loopIndices.push_back(curr);
-                                curr = (curr + 1) % nSize;
-                            } else break;
-                        }
-
-                        // Calculate total winding angle around the pin to check if it's already wrapped
-                        float totalAngleChange = 0.0f;
-                        for (size_t i = 0; i < loopIndices.size() - 1; i++) {
-                            float a1 = std::atan2(sequence[loopIndices[i]]->pos.y - clickedFace->pos.y, sequence[loopIndices[i]]->pos.x - clickedFace->pos.x);
-                            float a2 = std::atan2(sequence[loopIndices[i+1]]->pos.y - clickedFace->pos.y, sequence[loopIndices[i+1]]->pos.x - clickedFace->pos.x);
-                            float diff = a2 - a1;
-                            while (diff < -PI) diff += 2.0f * PI;
-                            while (diff > PI) diff -= 2.0f * PI;
-                            totalAngleChange += diff;
-                        }
-
-                        // State Determination: If the path sweeps more than ~170 degrees, it is wrapped
-                        if (std::abs(totalAngleChange) > 3.0f && loopIndices.size() > 2) {
-                            // ---- REIDEMEISTER 1: SMOOTH PHYSICS UNWRAP ----
-                            int targetFaceId = -1;
-                            for (auto& [fId, itemSet] : faceMap) {
-                                if (itemSet.contains(clickedFace)) {
-                                    targetFaceId = fId;
-                                    break;
-                                }
-                            }
-
-                            // Flag the interior loop beads to shrink and bypass the pin's collision
-                            for (size_t i = 1; i < loopIndices.size() - 1; i++) {
-                                auto bead = sequence[loopIndices[i]];
-                                collapsingBeads[bead->id] = 1.0f; // Initialize collapse multiplier
-                                
-                                if (targetFaceId != -1) {
-                                    faceMap[targetFaceId].erase(bead); // Disable pin collision immediately
-                                }
-                            }
-                        }
-                        else {
-                            // ---- REIDEMEISTER 1: WRAP MOVE ----
-                            float startAngle = std::atan2(sequence[closestIdx]->pos.y - clickedFace->pos.y, sequence[closestIdx]->pos.x - clickedFace->pos.x);
-                            float loopRadius = RADIUS * 1.4f; // Sits comfortably right outside the pin
-                            float circumference = 2.0f * PI * loopRadius;
-                            int numNewBeads = std::max(8, (int)std::ceil(circumference / REST_LENGTH));
-
-                            std::vector<std::shared_ptr<Bead>> newLoopBeads;
-                            for (int i = 1; i <= numNewBeads; i++) {
-                                float angle = startAngle + (i * 2.0f * PI / (numNewBeads + 1));
-                                Vector2 newPos = {
-                                    clickedFace->pos.x + std::cos(angle) * loopRadius,
-                                    clickedFace->pos.y + std::sin(angle) * loopRadius
-                                };
-
-                                auto newBead = std::make_shared<Bead>(idCounter++, newPos, "edge");
-                                nodes.push_back(newBead);
-
-                                // Find the clicked pin's local cell map entry and inject our new bead
-                                int targetFaceId = -1;
-                                for (auto& [fId, itemSet] : faceMap) {
-                                    if (itemSet.contains(clickedFace)) {
-                                        targetFaceId = fId;
-                                        break;
-                                    }
-                                }
-                                if (targetFaceId != -1) {
-                                    faceMap[targetFaceId].insert(newBead);
-                                }
-
-                                newLoopBeads.push_back(newBead);
-                            }
-                            // Splice the loop directly into the simulation sequence
-                            sequence.insert(sequence.begin() + closestIdx + 1, newLoopBeads.begin(), newLoopBeads.end());
-                        }
-                    }
-                }
-                else {
-                    // 2. Fallback: Search for valid node element intersections to drag instead
-                    for (auto& n : nodes) {
-                        if (!n->active) continue;
-                        if (CheckCollisionPointCircle(mousePos, n->pos, RADIUS)) {
-                            draggingBead = n;
-                            dragOffset = { n->pos.x - mousePos.x, n->pos.y - mousePos.y };
-                            break;
-                        }
                     }
                 }
             }
         }
+
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && draggingBead != nullptr) {
             draggingBead->pos = { mousePos.x + dragOffset.x, mousePos.y + dragOffset.y };
         }
@@ -615,13 +490,7 @@ int main() {
                 float dist = std::hypot(dx, dy);
 
                 if (dist == 0.0f) continue;
-
-                // Smoothly scale rest length toward zero for transitioning segments
-                float currentRest = REST_LENGTH;
-                if (collapsingBeads.contains(n1->id)) currentRest *= collapsingBeads[n1->id];
-                if (collapsingBeads.contains(n2->id)) currentRest *= collapsingBeads[n2->id];
-
-                float displacement = dist - currentRest;
+                float displacement = dist - REST_LENGTH;
                 currentTension += std::abs(displacement);
 
                 float forceMag = displacement * SPRING_CONSTANT;
@@ -697,28 +566,6 @@ int main() {
         // --------------------------------------------------------------------
         // D. HARDWARE RENDER SYSTEM DRAW PASS
         // --------------------------------------------------------------------
-        // --------------------------------------------------------------------
-        // E. COLLAPSE TRANSITION TICK & CLEANUP
-        // --------------------------------------------------------------------
-        for (auto it = collapsingBeads.begin(); it != collapsingBeads.end();) {
-            it->second -= 0.05f; // Reduce structural size by 5% per frame (~20 frames total)
-            
-            if (it->second <= 0.0f) {
-                int idToRemove = it->first;
-                
-                // Flag master node array 
-                auto nodeIt = std::find_if(nodes.begin(), nodes.end(), [idToRemove](const auto& n) { return n->id == idToRemove; });
-                if (nodeIt != nodes.end()) (*nodeIt)->active = false;
-
-                // Erase cleanly from live continuous wire rendering sequence
-                sequence.erase(std::remove_if(sequence.begin(), sequence.end(), 
-                    [idToRemove](const auto& b) { return b->id == idToRemove; }), sequence.end());
-                
-                it = collapsingBeads.erase(it); // Safe collection removal during iteration
-            } else {
-                ++it;
-            }
-        }
         BeginDrawing();
         ClearBackground(BLACK);
 
